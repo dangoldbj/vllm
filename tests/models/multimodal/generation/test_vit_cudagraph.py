@@ -182,13 +182,64 @@ MODEL_CONFIGS: dict[str, VitCudagraphTestConfig] = {
 }
 
 
-def get_compilation_config(config: VitCudagraphTestConfig):
+def get_compilation_config(
+    config: VitCudagraphTestConfig,
+    *,
+    cudagraph_mm_encoder: bool,
+    compile_mm_encoder: bool = False,
+):
     return {
-        "cudagraph_mm_encoder": True,
+        "cudagraph_mm_encoder": cudagraph_mm_encoder,
+        "compile_mm_encoder": compile_mm_encoder,
         "encoder_cudagraph_max_vision_items_per_batch": 1,
         "encoder_cudagraph_max_frames_per_batch": 16,
         **config.compilation_config_overrides,
     }
+
+
+def generate_greedy_under_encoder_config(
+    vllm_runner,
+    config: VitCudagraphTestConfig,
+    prompts: list[str],
+    mm_kwargs: dict,
+    mm_limit: dict[str, int],
+    *,
+    cudagraph_mm_encoder: bool,
+    compile_mm_encoder: bool = False,
+):
+    """Greedily generate with the given ViT encoder compilation mode."""
+    with vllm_runner(
+        config.model,
+        dtype=config.dtype,
+        max_model_len=config.max_model_len,
+        max_num_seqs=config.max_num_seqs,
+        limit_mm_per_prompt=mm_limit,
+        compilation_config=get_compilation_config(
+            config,
+            cudagraph_mm_encoder=cudagraph_mm_encoder,
+            compile_mm_encoder=compile_mm_encoder,
+        ),
+        **config.vllm_runner_kwargs,
+    ) as vllm_model:
+        return vllm_model.generate_greedy(prompts, config.max_tokens, **mm_kwargs)
+
+
+def assert_encoder_cudagraph_parity(eager_outputs, cudagraph_outputs):
+    """Encoder CUDA graph replay is numerically identical to eager execution,
+    so greedy decoding must yield the same tokens. A mismatch means the
+    captured graph corrupts the vision embeddings; an empty output means the
+    encoder produced nothing.
+    """
+    assert len(eager_outputs) == len(cudagraph_outputs)
+    for (eager_ids, eager_text), (cg_ids, cg_text) in zip(
+        eager_outputs, cudagraph_outputs
+    ):
+        assert len(cg_ids) > 0 and len(cg_text) > 0
+        assert eager_ids == cg_ids, (
+            "Encoder CUDA graph output diverged from eager execution:\n"
+            f"  eager:     {eager_text!r}\n"
+            f"  cudagraph: {cg_text!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -211,30 +262,28 @@ def test_vit_cudagraph_image(model_id, vllm_runner, image_assets):
         }
     )
     images = [[asset.pil_image] for asset in image_assets]
+    mm_kwargs = {"images": images}
+    mm_limit = {"image": 1}
 
-    with vllm_runner(
-        config.model,
-        dtype=config.dtype,
-        max_model_len=config.max_model_len,
-        max_num_seqs=config.max_num_seqs,
-        limit_mm_per_prompt={"image": 1},
-        compilation_config=get_compilation_config(config),
-        **config.vllm_runner_kwargs,
-    ) as vllm_model:
-        outputs = vllm_model.generate_greedy(
-            image_prompts, config.max_tokens, images=images
-        )
+    eager_outputs = generate_greedy_under_encoder_config(
+        vllm_runner,
+        config,
+        image_prompts,
+        mm_kwargs,
+        mm_limit,
+        cudagraph_mm_encoder=False,
+    )
+    cudagraph_outputs = generate_greedy_under_encoder_config(
+        vllm_runner,
+        config,
+        image_prompts,
+        mm_kwargs,
+        mm_limit,
+        cudagraph_mm_encoder=True,
+    )
 
-        # Basic validation that we got a response
-        assert len(outputs) == 2
-        output_ids, output_text = outputs[0]
-
-        # Ensure we got some output
-        assert len(output_ids) > 0
-        assert len(output_text) > 0
-
-        # Ensure the output is a string
-        assert isinstance(output_text, str)
+    assert len(cudagraph_outputs) == 2
+    assert_encoder_cudagraph_parity(eager_outputs, cudagraph_outputs)
 
 
 @pytest.mark.parametrize("model_id", params_with_marks(MODEL_CONFIGS))
@@ -263,27 +312,25 @@ def test_vit_cudagraph_video(model_id, vllm_runner, video_assets):
             for asset in video_assets
         ]
     videos = [sampled_vids[0]]
+    mm_kwargs = {"videos": videos}
+    mm_limit = {"video": 1}
 
-    with vllm_runner(
-        config.model,
-        dtype=config.dtype,
-        max_model_len=config.max_model_len,
-        max_num_seqs=config.max_num_seqs,
-        limit_mm_per_prompt={"video": 1},
-        compilation_config=get_compilation_config(config),
-        **config.vllm_runner_kwargs,
-    ) as vllm_model:
-        outputs = vllm_model.generate_greedy(
-            video_prompts, config.max_tokens, videos=videos
-        )
+    eager_outputs = generate_greedy_under_encoder_config(
+        vllm_runner,
+        config,
+        video_prompts,
+        mm_kwargs,
+        mm_limit,
+        cudagraph_mm_encoder=False,
+    )
+    cudagraph_outputs = generate_greedy_under_encoder_config(
+        vllm_runner,
+        config,
+        video_prompts,
+        mm_kwargs,
+        mm_limit,
+        cudagraph_mm_encoder=True,
+    )
 
-        # Basic validation that we got a response
-        assert len(outputs) == 1
-        output_ids, output_text = outputs[0]
-
-        # Ensure we got some output
-        assert len(output_ids) > 0
-        assert len(output_text) > 0
-
-        # Ensure the output is a string
-        assert isinstance(output_text, str)
+    assert len(cudagraph_outputs) == 1
+    assert_encoder_cudagraph_parity(eager_outputs, cudagraph_outputs)
